@@ -6,14 +6,13 @@ import { createF1Car } from './F1Car'
 import { createCircuitDetails } from './CircuitDetails'
 import { LapTimer } from '../simulation/LapTimer'
 import { VehicleDynamics } from '../simulation/VehicleDynamics'
+import { CornerAnalyzer } from '../simulation/CornerAnalyzer'
 
-// State
 const container = ref(null)
 
 const speed = ref(0)
 const gear = ref(1)
 const driving = ref(false)
-
 const surface = ref('ASPHALT')
 const grip = ref(100)
 const warning = ref('')
@@ -27,18 +26,47 @@ const lapStatus = ref('READY')
 const cameraMode = ref('CHASE')
 const cameraModes = ['CHASE', 'COCKPIT', 'AERIAL']
 
-// Telemetry
 const throttle = ref(0)
 const brake = ref(0)
 const steering = ref(0)
 const speedHistory = ref([0])
 
+const upcomingTurn = ref('--')
+const cornerDistance = ref('--')
+const suggestedSpeed = ref('--')
+const engineerMessage = ref('CIRCUIT READY')
+const engineerLevel = ref('normal')
+const detectedCorners = ref(0)
+
 const MAX_SPEED_SAMPLES = 100
 const GRAPH_WIDTH = 500
 const GRAPH_HEIGHT = 110
 const GRAPH_MAX_SPEED = 340
+const TRACK_WIDTH = 9
 
+let scene
+let camera
+let renderer
+let controls
+let resizeObserver
+let animationId
+let car
+let trackCurve
+let lapTimer
+let vehicle
+let cornerAnalyzer
+
+let lastTime = 0
+let simulationTime = 0
 let lastSpeedSampleTime = 0
+let isMounted = false
+
+const keys = {
+  forward: false,
+  backward: false,
+  left: false,
+  right: false
+}
 
 const speedGraphPoints = computed(() => {
   const samples = speedHistory.value
@@ -55,31 +83,6 @@ const speedGraphPoints = computed(() => {
   }).join(' ')
 })
 
-let scene
-let camera
-let renderer
-let controls
-let resizeObserver
-let animationId
-let car
-let trackCurve
-let lapTimer
-let vehicle
-
-let lastTime = 0
-let simulationTime = 0
-let isMounted = false
-
-const TRACK_WIDTH = 9
-
-const keys = {
-  forward: false,
-  backward: false,
-  left: false,
-  right: false
-}
-
-// Format lap times
 function formatLapTime(seconds) {
   if (seconds === null || !Number.isFinite(seconds)) {
     return '--:--.---'
@@ -96,7 +99,6 @@ function formatLapTime(seconds) {
   )
 }
 
-// Update lap telemetry
 function updateLapHUD() {
   if (!lapTimer) return
 
@@ -118,7 +120,6 @@ function updateLapHUD() {
   }
 }
 
-// Update driving input telemetry
 function updateInputTelemetry() {
   throttle.value = keys.forward ? 100 : 0
   brake.value = keys.backward ? 100 : 0
@@ -128,11 +129,8 @@ function updateInputTelemetry() {
     (keys.left ? 100 : 0)
 }
 
-// Record speed samples
 function recordSpeed() {
-  if (simulationTime - lastSpeedSampleTime < 0.15) {
-    return
-  }
+  if (simulationTime - lastSpeedSampleTime < 0.15) return
 
   lastSpeedSampleTime = simulationTime
 
@@ -142,13 +140,37 @@ function recordSpeed() {
   ]
 }
 
-// Switch camera modes
+function updateCornerTelemetry() {
+  if (!cornerAnalyzer || !lapTimer || !car) return
+
+  const trackInfo = lapTimer.getProgress(car.position)
+
+  const guidance = cornerAnalyzer.getGuidance(
+    trackInfo.progress,
+    speed.value
+  )
+
+  const corner = guidance.corner
+
+  if (corner) {
+    upcomingTurn.value = corner.name
+    cornerDistance.value = corner.distance
+    suggestedSpeed.value = corner.suggestedSpeed
+  } else {
+    upcomingTurn.value = '--'
+    cornerDistance.value = '--'
+    suggestedSpeed.value = '--'
+  }
+
+  engineerMessage.value = guidance.message
+  engineerLevel.value = guidance.level
+}
+
 function switchCamera() {
   const index = cameraModes.indexOf(cameraMode.value)
   cameraMode.value = cameraModes[(index + 1) % cameraModes.length]
 }
 
-// Keyboard controls
 function keyDown(event) {
   const key = event.key.toLowerCase()
 
@@ -190,7 +212,6 @@ function resetKeys() {
   steering.value = 0
 }
 
-// Reset car and simulation
 function resetCar() {
   if (!car || !trackCurve) return
 
@@ -227,9 +248,9 @@ function resetCar() {
   speedHistory.value = [0]
 
   resetKeys()
+  updateCornerTelemetry()
 }
 
-// Toggle driving mode
 function toggleDriving() {
   if (!car) return
 
@@ -246,7 +267,6 @@ function toggleDriving() {
   }
 }
 
-// Generate circuit road
 function createTrack(curve) {
   const segments = 500
   const vertices = []
@@ -308,11 +328,166 @@ function createTrack(curve) {
   )
 
   road.receiveShadow = true
-
   return road
 }
 
-// Initialize Three.js scene
+// Create numbered turn markers
+function createCornerMarker(corner) {
+  const canvas = document.createElement('canvas')
+  canvas.width = 256
+  canvas.height = 256
+
+  const ctx = canvas.getContext('2d')
+
+  ctx.fillStyle = '#11151c'
+  ctx.beginPath()
+  ctx.arc(128, 128, 105, 0, Math.PI * 2)
+  ctx.fill()
+
+  ctx.strokeStyle = '#ff3434'
+  ctx.lineWidth = 13
+  ctx.stroke()
+
+  ctx.fillStyle = '#ffffff'
+  ctx.font = 'bold 88px Arial'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.fillText(String(corner.id), 128, 133)
+
+  const texture = new THREE.CanvasTexture(canvas)
+
+  const material = new THREE.SpriteMaterial({
+    map: texture,
+    transparent: true,
+    depthTest: true
+  })
+
+  const marker = new THREE.Sprite(material)
+
+  const tangent = trackCurve.getTangentAt(corner.progress)
+
+  const normal = new THREE.Vector3(
+    tangent.z,
+    0,
+    -tangent.x
+  ).normalize()
+
+  marker.position.copy(corner.position)
+  marker.position.addScaledVector(normal, 8)
+  marker.position.y += 4
+
+  marker.scale.set(5, 5, 1)
+
+  return marker
+}
+
+// Draw braking zones along the road
+function createBrakingZone(corner) {
+  const group = new THREE.Group()
+  const length = cornerAnalyzer.trackLength
+
+  if (length <= 0) return group
+
+  const zoneDistance = Math.min(
+    corner.brakingDistance,
+    65
+  )
+
+  if (zoneDistance <= 0) return group
+
+  const segments = 24
+  const zoneProgress = zoneDistance / length
+
+  const vertices = []
+  const colors = []
+  const indices = []
+
+  const yellow = new THREE.Color('#facc15')
+  const red = new THREE.Color('#ef4444')
+
+  for (let i = 0; i <= segments; i++) {
+    const fraction = i / segments
+
+    const progress = (
+      corner.progress -
+      zoneProgress +
+      zoneProgress * fraction +
+      1
+    ) % 1
+
+    const point = trackCurve.getPointAt(progress)
+    const tangent = trackCurve.getTangentAt(progress)
+
+    const normal = new THREE.Vector3(
+      tangent.z,
+      0,
+      -tangent.x
+    ).normalize()
+
+    const halfWidth = TRACK_WIDTH * 0.36
+
+    const left = point.clone().addScaledVector(
+      normal,
+      halfWidth
+    )
+
+    const right = point.clone().addScaledVector(
+      normal,
+      -halfWidth
+    )
+
+    left.y += 0.09
+    right.y += 0.09
+
+    vertices.push(left.x, left.y, left.z)
+    vertices.push(right.x, right.y, right.z)
+
+    const color = fraction < 0.6 ? yellow : red
+
+    colors.push(color.r, color.g, color.b)
+    colors.push(color.r, color.g, color.b)
+
+    if (i < segments) {
+      const a = i * 2
+      const b = a + 1
+      const c = a + 2
+      const d = a + 3
+
+      indices.push(a, c, b)
+      indices.push(b, c, d)
+    }
+  }
+
+  const geometry = new THREE.BufferGeometry()
+
+  geometry.setAttribute(
+    'position',
+    new THREE.Float32BufferAttribute(vertices, 3)
+  )
+
+  geometry.setAttribute(
+    'color',
+    new THREE.Float32BufferAttribute(colors, 3)
+  )
+
+  geometry.setIndex(indices)
+  geometry.computeVertexNormals()
+
+  const material = new THREE.MeshBasicMaterial({
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.45,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+    polygonOffset: true,
+    polygonOffsetFactor: -1
+  })
+
+  group.add(new THREE.Mesh(geometry, material))
+
+  return group
+}
+
 onMounted(async () => {
   isMounted = true
 
@@ -352,7 +527,6 @@ onMounted(async () => {
 
   container.value.appendChild(renderer.domElement)
 
-  // Camera controls
   controls = new OrbitControls(
     camera,
     renderer.domElement
@@ -364,7 +538,6 @@ onMounted(async () => {
   controls.maxDistance = 160
   controls.target.set(0, 0, 0)
 
-  // Lighting
   scene.add(new THREE.AmbientLight(0xffffff, 1.3))
 
   const sun = new THREE.DirectionalLight(
@@ -383,7 +556,6 @@ onMounted(async () => {
 
   scene.add(sun)
 
-  // Terrain
   const terrainGeometry = new THREE.PlaneGeometry(
     250,
     250,
@@ -412,7 +584,6 @@ onMounted(async () => {
   terrain.receiveShadow = true
   scene.add(terrain)
 
-  // Rwanda-inspired circuit
   const points = [
     [-40, -12],
     [-35, -35],
@@ -433,13 +604,9 @@ onMounted(async () => {
     'centripetal'
   )
 
-  // Road and circuit infrastructure
   scene.add(createTrack(trackCurve))
-  scene.add(
-    createCircuitDetails(trackCurve, TRACK_WIDTH)
-  )
+  scene.add(createCircuitDetails(trackCurve, TRACK_WIDTH))
 
-  // Racing line
   const racingLinePoints = trackCurve
     .getPoints(500)
     .map(point => {
@@ -459,7 +626,17 @@ onMounted(async () => {
 
   scene.add(racingLine)
 
-  // Initialize car and simulation systems
+  // Initialize race engineering systems
+  cornerAnalyzer = new CornerAnalyzer(trackCurve)
+
+  const corners = cornerAnalyzer.getCorners()
+  detectedCorners.value = corners.length
+
+  for (const corner of corners) {
+    scene.add(createBrakingZone(corner))
+    scene.add(createCornerMarker(corner))
+  }
+
   car = createF1Car('#ff2525')
   scene.add(car)
 
@@ -468,7 +645,6 @@ onMounted(async () => {
 
   resetCar()
 
-  // Responsive resizing
   resizeObserver = new ResizeObserver(() => {
     if (!container.value) return
 
@@ -484,12 +660,10 @@ onMounted(async () => {
 
   resizeObserver.observe(container.value)
 
-  // Event listeners
   window.addEventListener('keydown', keyDown)
   window.addEventListener('keyup', keyUp)
   window.addEventListener('blur', resetKeys)
 
-  // Animation loop
   const animate = (time) => {
     animationId = requestAnimationFrame(animate)
 
@@ -503,10 +677,8 @@ onMounted(async () => {
     if (driving.value) {
       simulationTime += dt
 
-      // Update input telemetry
       updateInputTelemetry()
 
-      // Calculate track position and vehicle dynamics
       const trackInfo = lapTimer.getProgress(
         car.position
       )
@@ -520,7 +692,6 @@ onMounted(async () => {
 
       car.rotation.y = state.heading
 
-      // Move car
       car.position.x -=
         Math.sin(state.heading) *
         state.speed *
@@ -531,7 +702,6 @@ onMounted(async () => {
         state.speed *
         dt
 
-      // Detect track limits
       const newTrackInfo = lapTimer.getProgress(
         car.position
       )
@@ -547,7 +717,6 @@ onMounted(async () => {
           : vehicle.trackGrip * 100
       )
 
-      // Update lap timing
       lapTimer.update(
         car.position,
         simulationTime,
@@ -556,7 +725,6 @@ onMounted(async () => {
 
       updateLapHUD()
 
-      // Race engineer warnings
       if (offTrack) {
         warning.value = 'TRACK LIMITS EXCEEDED'
       } else if (
@@ -568,7 +736,20 @@ onMounted(async () => {
         warning.value = ''
       }
 
-      // Camera modes
+      speed.value = Math.round(state.speed * 3.6)
+
+      gear.value = Math.min(
+        8,
+        Math.max(
+          1,
+          Math.floor(speed.value / 45) + 1
+        )
+      )
+
+      updateCornerTelemetry()
+      recordSpeed()
+
+      // Update driving camera
       const heading = state.heading
 
       const forward = new THREE.Vector3(
@@ -613,20 +794,6 @@ onMounted(async () => {
         camera.position.lerp(desiredCamera, 0.08)
         camera.lookAt(lookTarget)
       }
-
-      // Speedometer and gear
-      speed.value = Math.round(state.speed * 3.6)
-
-      gear.value = Math.min(
-        8,
-        Math.max(
-          1,
-          Math.floor(speed.value / 45) + 1
-        )
-      )
-
-      // Record speed history
-      recordSpeed()
     } else {
       controls.update()
     }
@@ -637,7 +804,6 @@ onMounted(async () => {
   animationId = requestAnimationFrame(animate)
 })
 
-// Cleanup
 onBeforeUnmount(() => {
   isMounted = false
 
@@ -658,7 +824,10 @@ onBeforeUnmount(() => {
         ? object.material
         : [object.material]
 
-      materials.forEach(material => material.dispose())
+      materials.forEach(material => {
+        material.map?.dispose()
+        material.dispose()
+      })
     }
   })
 
@@ -671,12 +840,49 @@ onBeforeUnmount(() => {
   <div class="simulator">
     <div ref="container" class="circuit-container"></div>
 
-    <!-- Race engineer warning -->
     <div v-if="warning" class="engineer-warning">
       ⚠ {{ warning }}
     </div>
 
-    <!-- Live telemetry -->
+    <!-- Race engineer -->
+    <div class="race-engineer">
+      <div class="engineer-heading">
+        <span>APEX RACE ENGINEER</span>
+        <span class="live-label">● LIVE ANALYSIS</span>
+      </div>
+
+      <div
+        class="engineer-message"
+        :class="engineerLevel"
+      >
+        <span class="engineer-icon">◉</span>
+        {{ engineerMessage }}
+      </div>
+
+      <div class="corner-grid">
+        <div class="corner-stat">
+          <span>UPCOMING CORNER</span>
+          <strong>{{ upcomingTurn }}</strong>
+        </div>
+
+        <div class="corner-stat">
+          <span>DISTANCE</span>
+          <strong>{{ cornerDistance }} <small>m</small></strong>
+        </div>
+
+        <div class="corner-stat">
+          <span>SUGGESTED SPEED</span>
+          <strong>{{ suggestedSpeed }} <small>km/h</small></strong>
+        </div>
+
+        <div class="corner-stat">
+          <span>DETECTED CORNERS</span>
+          <strong>{{ detectedCorners }}</strong>
+        </div>
+      </div>
+    </div>
+
+    <!-- Lap telemetry -->
     <div class="hud">
       <div class="hud-item">
         <span class="hud-label">SPEED</span>
@@ -738,7 +944,7 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <!-- Driving input telemetry -->
+    <!-- Driver telemetry -->
     <div class="telemetry-panel">
       <div class="telemetry-heading">
         <span>DRIVER INPUT TELEMETRY</span>
@@ -775,7 +981,6 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <!-- Steering indicator -->
       <div class="steering-section">
         <div class="meter-heading">
           <span>STEERING INPUT</span>
@@ -799,7 +1004,6 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <!-- Speed history graph -->
       <div class="speed-chart">
         <div class="telemetry-heading">
           <span>SPEED HISTORY</span>
@@ -820,24 +1024,15 @@ onBeforeUnmount(() => {
             aria-label="Live speed history graph"
           >
             <line
-              x1="0"
-              y1="0"
-              x2="500"
-              y2="0"
+              x1="0" y1="0" x2="500" y2="0"
               class="chart-gridline"
             />
             <line
-              x1="0"
-              y1="55"
-              x2="500"
-              y2="55"
+              x1="0" y1="55" x2="500" y2="55"
               class="chart-gridline"
             />
             <line
-              x1="0"
-              y1="110"
-              x2="500"
-              y2="110"
+              x1="0" y1="110" x2="500" y2="110"
               class="chart-gridline"
             />
 
@@ -909,13 +1104,102 @@ onBeforeUnmount(() => {
 }
 
 @keyframes warningPulse {
-  0%, 100% {
-    background: #531818;
-  }
+  0%, 100% { background: #531818; }
+  50% { background: #871d1d; }
+}
 
-  50% {
-    background: #871d1d;
-  }
+.race-engineer {
+  background: #11151b;
+  border: 1px solid #343a44;
+  padding: 25px 35px;
+}
+
+.engineer-heading,
+.telemetry-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 15px;
+  color: #ddd;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 2px;
+}
+
+.live-label {
+  color: #4ade80;
+  font-size: 10px;
+}
+
+.engineer-message {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 22px;
+  padding: 20px;
+  background: #1a222c;
+  border-left: 4px solid #64748b;
+  color: #fff;
+  font-size: 17px;
+  font-weight: 900;
+  letter-spacing: 1px;
+}
+
+.engineer-icon {
+  font-size: 23px;
+}
+
+.engineer-message.normal {
+  border-color: #64748b;
+}
+
+.engineer-message.info {
+  border-color: #38bdf8;
+  color: #7dd3fc;
+}
+
+.engineer-message.warning {
+  border-color: #facc15;
+  color: #fde047;
+}
+
+.engineer-message.danger {
+  border-color: #ef4444;
+  color: #ff5757;
+  background: #32171c;
+}
+
+.corner-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 18px;
+  margin-top: 22px;
+}
+
+.corner-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: #191e26;
+  padding: 18px;
+  min-width: 0;
+}
+
+.corner-stat span {
+  color: #9299a5;
+  font-size: 9px;
+  letter-spacing: 1.5px;
+}
+
+.corner-stat strong {
+  color: #fff;
+  font-size: 22px;
+  font-weight: 900;
+}
+
+.corner-stat small {
+  font-size: 11px;
+  color: #aaa;
 }
 
 .hud {
@@ -977,22 +1261,6 @@ onBeforeUnmount(() => {
   background: #0c0f13;
   border: 1px solid #292929;
   border-top: none;
-}
-
-.telemetry-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 15px;
-  color: #ddd;
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 2px;
-}
-
-.live-label {
-  color: #4ade80;
-  font-size: 10px;
 }
 
 .input-grid {
@@ -1187,6 +1455,23 @@ onBeforeUnmount(() => {
     height: 450px;
   }
 
+  .race-engineer,
+  .telemetry-panel {
+    padding: 20px;
+  }
+
+  .corner-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .corner-stat strong {
+    font-size: 18px;
+  }
+
+  .engineer-message {
+    font-size: 14px;
+  }
+
   .hud {
     gap: 20px;
     padding: 20px;
@@ -1198,10 +1483,6 @@ onBeforeUnmount(() => {
 
   .hud .lap-time {
     font-size: 18px;
-  }
-
-  .telemetry-panel {
-    padding: 20px;
   }
 
   .input-grid {
